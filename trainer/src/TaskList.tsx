@@ -16,7 +16,10 @@ export default function TaskList({ tasks, onSelect, selectedId }: TaskListProps)
             <button 
               type="button" 
               onClick={() => onSelect(task.id)}
-              aria-current={task.id === selectedId}
+              aria-current = {task.id === selectedId}
+              style = {{
+                fontWeight: task.id === selectedId ? "bold" : "normal"
+              }}
             >
               {task.topic}: {task.prompt}
             </button>
