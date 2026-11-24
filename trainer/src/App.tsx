@@ -1,102 +1,139 @@
 import { useState, useEffect, useReducer } from "react";
 import { mainSet } from "./data";
 import { getProgress } from "./domain";
+import {
+  attemptReducer,
+  createInitialAttempt,
+  getUnansweredTasks,
+  validateDraft,
+} from "./attempt";
 import TaskList from "./TaskList";
 import TaskCard from "./TaskCard";
-import { attemptReducer, State } from "./attempt";
+import TaskReview from "./TaskReview";
 
-const STORAGE_KEY = "trainer-draft";
+const STORAGE_KEY = `trainer-draft:${mainSet.id}`;
 
 export default function App() {
+  const [state, dispatch] = useReducer(
+    attemptReducer,
+    mainSet,
+    createInitialAttempt
+  );
+  const [isHydrated, setIsHydrated] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-
-  const initialState: State = {
-    version: 1,
-    setId: mainSet.id,
-    taskId: mainSet.tasks[0]?.id || "",
-    answers: [],
-    status: "in-progress",
-  };
-
-  const [state, dispatch] = useReducer(attemptReducer, initialState);
+  const [showReview, setShowReview] = useState(false);
 
   useEffect(() => {
+    let raw: string | null;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw === null) return;
-
-      const v = JSON.parse(raw);
-
-      if (
-        !v || typeof v !== "object" ||
-        v.version !== 1 || 
-        v.setId !== mainSet.id ||
-        !Array.isArray(v.answers) ||
-        !["in-progress", "submitted"].includes(v.status)
-      ) {
-        setStorageError("Черновик повреждён или несовместим. Текущее состояние не изменено.");
-        return;
-      }
-
-      dispatch({ type: "restored", state: v as State });
-    } catch (e) {
-      setStorageError("Ошибка чтения из хранилища. Формат повреждён.");
+      raw = localStorage.getItem(STORAGE_KEY);
+    } catch {
+      setSaveError(
+        "Хранилище недоступно. Ответы сохраняются только в текущей вкладке."
+      );
+      setIsHydrated(true);
+      return;
     }
+
+    if (raw === null) {
+      setIsHydrated(true);
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      setStorageError("Черновик повреждён (некорректный JSON).");
+      return;
+    }
+
+    const validation = validateDraft(parsed, mainSet);
+    if (!validation.ok) {
+      setStorageError(validation.reason);
+      return;
+    }
+
+    dispatch({ type: "restored", state: validation.state });
+    setIsHydrated(true);
   }, []);
 
   useEffect(() => {
-    if (storageError) return;
+    if (!isHydrated || storageError) return;
 
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       setSaveError(null);
-    } catch (e) {
-      setSaveError("Запись недоступна. Ваши ответы сохраняются только в текущей вкладке.");
+    } catch {
+      setSaveError(
+        "Запись недоступна. Ваши ответы сохраняются только в текущей вкладке."
+      );
     }
-  }, [state, storageError]);
+  }, [state, isHydrated, storageError]);
 
   function handleReset() {
     setStorageError(null);
     setSaveError(null);
-    dispatch({ type: "reset", setId: mainSet.id, initialTaskId: mainSet.tasks[0]?.id || "" });
+    setShowReview(false);
+    setIsHydrated(true);
+    dispatch({
+      type: "reset",
+      setId: mainSet.id,
+      initialTaskId: mainSet.tasks[0]?.id ?? "",
+    });
     try {
       localStorage.removeItem(STORAGE_KEY);
-    } catch (e) {}
+    } catch {
+      setSaveError(
+        "Не удалось очистить хранилище, но попытка сброшена в текущей вкладке."
+      );
+    }
   }
 
   if (storageError) {
     return (
-      <div style={{ padding: '24px', background: '#fee2e2', borderRadius: '8px' }}>
-        <h1>Ошибка загрузки</h1>
+      <div style={{ padding: "24px", background: "#fee2e2", borderRadius: "8px" }}>
+        <h1>Ошибка загрузки черновика</h1>
         <p>{storageError}</p>
-        <button onClick={handleReset} style={{ background: '#c0392b', color: 'white', padding: '10px 20px', border: 'none', borderRadius: '4px', cursor: 'pointer', marginTop: '10px' }}>
+        <button
+          type="button"
+          onClick={handleReset}
+          style={{
+            background: "#c0392b",
+            color: "white",
+            padding: "10px 20px",
+            border: "none",
+            borderRadius: "4px",
+            cursor: "pointer",
+            marginTop: "10px",
+          }}
+        >
           Явный сброс (Начать новую попытку)
         </button>
       </div>
     );
   }
 
-  if (mainSet.tasks.length === 0) return <div>В модуле пока нет заданий.</div>;
+  if (mainSet.tasks.length === 0) {
+    return <div>В модуле пока нет заданий.</div>;
+  }
 
   const currentIndex = mainSet.tasks.findIndex((t) => t.id === state.taskId);
-  const currentTask = mainSet.tasks[currentIndex !== -1 ? currentIndex : 0];
+  const safeIndex = currentIndex !== -1 ? currentIndex : 0;
+  const currentTask = mainSet.tasks[safeIndex];
   const currentAnswer = state.answers.find((a) => a.taskId === currentTask.id);
   const progress = getProgress(mainSet, state.answers);
+  const unansweredTasks = getUnansweredTasks(mainSet, state.answers);
 
   function handleFinish() {
-    const missedTasks = mainSet.tasks.filter((task) => {
-      const ans = state.answers.find((a) => a.taskId === task.id);
-      if (!ans) return true;
-      if (ans.kind === "single-choice") return ans.optionId.trim() === "";
-      if (ans.kind === "short-text") return ans.text.trim().length === 0;
-      return false;
-    });
-
-    if (missedTasks.length > 0) {
-      const ids = missedTasks.map((t) => t.id).join(", ");
-      if (!window.confirm(`Вы не ответили на задания: ${ids}. Завершить попытку?`)) return;
+    if (unansweredTasks.length > 0) {
+      const ids = unansweredTasks.map((t) => t.id).join(", ");
+      if (!window.confirm(`Вы не ответили на задания: ${ids}. Завершить попытку?`)) {
+        return;
+      }
     }
+    setShowReview(false);
     dispatch({ type: "submitted" });
   }
 
@@ -104,29 +141,51 @@ export default function App() {
     return (
       <div>
         <h1>{mainSet.title} — Результаты</h1>
-        <p>Заполнено: {progress.filled} из {progress.total}</p>
-        
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginTop: '20px' }}>
-          {mainSet.tasks.map((task) => {
-            const ans = state.answers.find((a) => a.taskId === task.id);
-            let ansText = "Нет ответа";
-            
-            if (ans?.kind === "single-choice") {
-              const opt = task.kind === "single-choice" ? task.options.find(o => o.id === ans.optionId) : null;
-              ansText = opt ? opt.label : ans.optionId;
-            } else if (ans?.kind === "short-text") {
-              ansText = ans.text.trim().length > 0 ? ans.text : "Пустой текст";
-            }
+        {saveError && (
+          <p style={{ color: "#d97706", fontWeight: "bold" }}>⚠️ {saveError}</p>
+        )}
+        <TaskReview set={mainSet} answers={state.answers} />
+        <button type="button" onClick={handleReset} style={{ marginTop: "20px" }}>
+          Начать новую попытку
+        </button>
+      </div>
+    );
+  }
 
-            return (
-              <div key={task.id} style={{ border: '1px solid #ccc', padding: '16px', borderRadius: '8px' }}>
-                <p><strong>{task.topic}:</strong> {task.prompt}</p>
-                <p style={{ marginTop: '8px', color: '#244a7c' }}>Ваш ответ: {ansText}</p>
-              </div>
-            );
-          })}
+  if (showReview) {
+    return (
+      <div>
+        <h1>{mainSet.title} — Обзор до завершения</h1>
+        {saveError && (
+          <p style={{ color: "#d97706", fontWeight: "bold" }}>⚠️ {saveError}</p>
+        )}
+
+        <TaskReview
+          set={mainSet}
+          answers={state.answers}
+          onClear={(taskId) => dispatch({ type: "answerCleared", taskId })}
+          onSelectTask={(taskId) => {
+            dispatch({ type: "moved", taskId });
+            setShowReview(false);
+          }}
+        />
+
+        <div style={{ display: "flex", gap: "10px", marginTop: "20px" }}>
+          <button type="button" onClick={() => setShowReview(false)}>
+            Вернуться к заданиям
+          </button>
+          <button
+            type="button"
+            onClick={handleFinish}
+            style={{
+              background: "#244a7c",
+              color: "white",
+              borderColor: "#244a7c",
+            }}
+          >
+            Завершить попытку
+          </button>
         </div>
-        <button onClick={handleReset} style={{ marginTop: '20px' }}>Начать новую попытку</button>
       </div>
     );
   }
@@ -134,47 +193,77 @@ export default function App() {
   return (
     <div>
       <h1>{mainSet.title}</h1>
-      <p>Прогресс: {progress.filled} из {progress.total}</p>
-      
-      {saveError && <p style={{ color: '#d97706', fontWeight: 'bold' }}>⚠️ {saveError}</p>}
+      <p>
+        Прогресс: {progress.filled} из {progress.total}
+        {unansweredTasks.length > 0
+          ? ` (пропущено: ${unansweredTasks.map((t) => t.id).join(", ")})`
+          : " (все задания заполнены)"}
+      </p>
+
+      {saveError && (
+        <p style={{ color: "#d97706", fontWeight: "bold" }}>⚠️ {saveError}</p>
+      )}
 
       <div className="container">
         <TaskList
           tasks={mainSet.tasks}
+          answers={state.answers}
           selectedId={currentTask.id}
           onSelect={(taskId) => dispatch({ type: "moved", taskId })}
         />
 
         <div style={{ flex: 2 }}>
-          <TaskCard 
-            task={currentTask} 
-            answer={currentAnswer} 
-            onAnswerChange={(ans) => dispatch({ type: "answerChanged", answer: ans })} 
+          <TaskCard
+            task={currentTask}
+            answer={currentAnswer}
+            onAnswerChange={(ans) =>
+              dispatch({ type: "answerChanged", answer: ans })
+            }
+            onClear={() =>
+              dispatch({ type: "answerCleared", taskId: currentTask.id })
+            }
           />
-          
-          <div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
-            <button 
+
+          <div style={{ display: "flex", gap: "10px", marginTop: "20px" }}>
+            <button
+              type="button"
               onClick={() => {
-                const prevId = mainSet.tasks[Math.max(0, currentIndex - 1)].id;
+                const prevId = mainSet.tasks[Math.max(0, safeIndex - 1)].id;
                 dispatch({ type: "moved", taskId: prevId });
               }}
-              disabled={currentIndex === 0}
+              disabled={safeIndex === 0}
             >
               Назад
             </button>
 
-            {currentIndex < mainSet.tasks.length - 1 ? (
-              <button onClick={() => {
-                const nextId = mainSet.tasks[Math.min(mainSet.tasks.length - 1, currentIndex + 1)].id;
+            <button
+              type="button"
+              onClick={() => {
+                const nextId =
+                  mainSet.tasks[Math.min(mainSet.tasks.length - 1, safeIndex + 1)]
+                    .id;
                 dispatch({ type: "moved", taskId: nextId });
-              }}>
-                Далее
-              </button>
-            ) : (
-              <button onClick={handleFinish} style={{ background: '#244a7c', color: 'white', borderColor: '#244a7c' }}>
-                Завершить попытку
-              </button>
-            )}
+              }}
+              disabled={safeIndex === mainSet.tasks.length - 1}
+            >
+              Далее
+            </button>
+
+            <button type="button" onClick={() => setShowReview(true)}>
+              Обзор ответов
+            </button>
+
+            <button
+              type="button"
+              onClick={handleFinish}
+              style={{
+                background: "#244a7c",
+                color: "white",
+                borderColor: "#244a7c",
+              }}
+            >
+              Завершить попытку
+            </button>
           </div>
         </div>
       </div>

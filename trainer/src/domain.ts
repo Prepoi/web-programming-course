@@ -1,4 +1,4 @@
-// Тип варианта ответа для задания с выбором 1 варианта 
+// Тип варианта ответа для задания с выбором 1 варианта
 export type TaskOption = {
   id: string;
   label: string;
@@ -47,10 +47,10 @@ export type ShortTextAnswer = {
   text: string;
 };
 
-// Ответ, как и задание - либо с выбором ответа, либо с текстовым ответом
+// Ответ, как и задание — либо с выбором ответа, либо с текстовым ответом
 export type Answer = SingleChoiceAnswer | ShortTextAnswer;
 
-// Результат рассчета прогресса
+// Результат расчёта прогресса
 export type Progress = {
   filled: number;
   total: number;
@@ -80,37 +80,32 @@ export function filterTasks(
   );
 }
 
-// Рассчитывает прогресс прохождения набора заданий
+export function isAnswerFilled(
+  task: Task,
+  answer: Answer | undefined
+): boolean {
+  if (!answer || answer.taskId !== task.id) {
+    return false;
+  }
+
+  if (task.kind === "single-choice" && answer.kind === "single-choice") {
+    return task.options.some((option) => option.id === answer.optionId);
+  }
+
+  if (task.kind === "short-text" && answer.kind === "short-text") {
+    return answer.text.trim().length > 0;
+  }
+
+  return false;
+}
+
 export function getProgress(
   set: TrainingSet,
   answers: Answer[]
 ): Progress {
   const filled = set.tasks.filter((task) => {
-    const answer = answers.find(
-      (answer) => answer.taskId === task.id
-    );
-
-    if (!answer) {
-      return false;
-    }
-
-    if (
-      task.kind === "single-choice" &&
-      answer.kind === "single-choice"
-    ) {
-      return task.options.some(
-        (option) => option.id === answer.optionId
-      );
-    }
-
-    if (
-      task.kind === "short-text" &&
-      answer.kind === "short-text"
-    ) {
-      return answer.text.trim().length > 0;
-    }
-
-    return false;
+    const answer = answers.find((item) => item.taskId === task.id);
+    return isAnswerFilled(task, answer);
   }).length;
 
   return {
