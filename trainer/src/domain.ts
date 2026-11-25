@@ -113,3 +113,39 @@ export function getProgress(
     total: set.tasks.length,
   };
 }
+
+// API
+export type RequestState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success" }
+  | { status: "error"; message: string };
+
+export type TrainingSetSummary = {
+  id: string;
+  title: string;
+  taskCount: number;
+};
+
+export type ServerAttempt = {
+  id: string;
+  setId: string;
+  status: "in-progress" | "submitted";
+  answers: Answer[];
+};
+
+export type ResultItem = {
+  taskId: string;
+  status: "correct" | "incorrect" | "unanswered" | "pending-review";
+  score: number | null;
+  maxScore: number;
+  feedback: string | null;
+};
+
+export type AttemptResult = {
+  attemptId: string;
+  status: "graded" | "pending-review";
+  score: number | null;
+  maxScore: number;
+  items: ResultItem[];
+};

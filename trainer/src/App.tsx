@@ -1,152 +1,234 @@
-import { useState, useEffect, useReducer } from "react";
-import { mainSet } from "./data";
+import { useEffect, useState } from "react";
+import type {
+  Answer,
+  AttemptResult,
+  RequestState,
+  ServerAttempt,
+  TrainingSet,
+} from "./domain";
 import { getProgress } from "./domain";
-import {
-  attemptReducer,
-  createInitialAttempt,
-  getUnansweredTasks,
-  validateDraft,
-} from "./attempt";
+import { getUnansweredTasks } from "./attempt";
+import { ApiError, trainerApi } from "./api/trainerApi";
 import TaskList from "./TaskList";
 import TaskCard from "./TaskCard";
 import TaskReview from "./TaskReview";
 
-const STORAGE_KEY = `trainer-draft:${mainSet.id}`;
+const STORAGE_ATTEMPT_KEY = "trainer_attempt_id";
 
 export default function App() {
-  const [state, dispatch] = useReducer(
-    attemptReducer,
-    mainSet,
-    createInitialAttempt
-  );
-  const [isHydrated, setIsHydrated] = useState(false);
-  const [storageError, setStorageError] = useState<string | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  const [trainingSet, setTrainingSet] = useState<TrainingSet | null>(null);
+  const [attempt, setAttempt] = useState<ServerAttempt | null>(null);
+  const [result, setResult] = useState<AttemptResult | null>(null);
+
+  const [selectedTaskId, setSelectedTaskId] = useState("");
   const [showReview, setShowReview] = useState(false);
 
-  useEffect(() => {
-    let raw: string | null;
-    try {
-      raw = localStorage.getItem(STORAGE_KEY);
-    } catch {
-      setSaveError(
-        "Хранилище недоступно. Ответы сохраняются только в текущей вкладке."
-      );
-      setIsHydrated(true);
-      return;
-    }
+  const [initState, setInitState] = useState<RequestState>({ status: "loading" });
+  const [actionState, setActionState] = useState<RequestState>({ status: "idle" });
+  const [restoreMessage, setRestoreMessage] = useState<string | null>(null);
 
-    if (raw === null) {
-      setIsHydrated(true);
-      return;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      setStorageError("Черновик повреждён (некорректный JSON).");
-      return;
-    }
-
-    const validation = validateDraft(parsed, mainSet);
-    if (!validation.ok) {
-      setStorageError(validation.reason);
-      return;
-    }
-
-    dispatch({ type: "restored", state: validation.state });
-    setIsHydrated(true);
-  }, []);
-
-  useEffect(() => {
-    if (!isHydrated || storageError) return;
+  async function loadInitialData() {
+    setInitState({ status: "loading" });
+    setRestoreMessage(null);
 
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      setSaveError(null);
-    } catch {
-      setSaveError(
-        "Запись недоступна. Ваши ответы сохраняются только в текущей вкладке."
-      );
-    }
-  }, [state, isHydrated, storageError]);
+      const sets = await trainerApi.getSets();
+      if (sets.length === 0) {
+        throw new Error("На сервере нет доступных учебных модулей.");
+      }
 
-  function handleReset() {
-    setStorageError(null);
-    setSaveError(null);
-    setShowReview(false);
-    setIsHydrated(true);
-    dispatch({
-      type: "reset",
-      setId: mainSet.id,
-      initialTaskId: mainSet.tasks[0]?.id ?? "",
-    });
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-    } catch {
-      setSaveError(
-        "Не удалось очистить хранилище, но попытка сброшена в текущей вкладке."
-      );
+      const loadedSet = await trainerApi.getSetById(sets[0].id);
+      setTrainingSet(loadedSet);
+      setSelectedTaskId(loadedSet.tasks[0]?.id ?? "");
+
+      const savedAttemptId = localStorage.getItem(STORAGE_ATTEMPT_KEY);
+      if (savedAttemptId) {
+        try {
+          const existing = await trainerApi.getAttempt(savedAttemptId);
+          setAttempt(existing);
+          if (existing.status === "submitted") {
+            const res = await trainerApi.getResult(existing.id);
+            setResult(res);
+          } else {
+            setResult(null);
+          }
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 404) {
+            localStorage.removeItem(STORAGE_ATTEMPT_KEY);
+            setRestoreMessage(
+              "Предыдущую подтверждённую попытку не удалось восстановить (сервер не нашёл ID). Начата новая попытка."
+            );
+            const fresh = await trainerApi.createAttempt(loadedSet.id);
+            localStorage.setItem(STORAGE_ATTEMPT_KEY, fresh.id);
+            setAttempt(fresh);
+            setResult(null);
+          } else {
+            throw err;
+          }
+        }
+      } else {
+        setRestoreMessage(
+          "Сохранённый идентификатор попытки не найден — восстановить подтверждённую попытку нельзя. Начата новая попытка."
+        );
+        const fresh = await trainerApi.createAttempt(loadedSet.id);
+        localStorage.setItem(STORAGE_ATTEMPT_KEY, fresh.id);
+        setAttempt(fresh);
+        setResult(null);
+      }
+
+      setInitState({ status: "success" });
+    } catch (err) {
+      setInitState({
+        status: "error",
+        message: err instanceof Error ? err.message : "Не удалось подключиться к серверу.",
+      });
     }
   }
 
-  if (storageError) {
+  useEffect(() => {
+    void loadInitialData();
+  }, []);
+
+  async function handleSaveAnswer(answer: Answer) {
+    if (!attempt) return;
+    setActionState({ status: "loading" });
+    try {
+      const updated = await trainerApi.saveAnswer(attempt.id, answer);
+      setAttempt(updated);
+      setActionState({ status: "success" });
+    } catch (err) {
+      setActionState({
+        status: "error",
+        message: err instanceof Error ? err.message : "Ошибка при сохранении ответа.",
+      });
+    }
+  }
+
+  async function handleClearAnswer(taskId: string) {
+    if (!attempt) return;
+    setActionState({ status: "loading" });
+    try {
+      const updated = await trainerApi.deleteAnswer(attempt.id, taskId);
+      setAttempt(updated);
+      setActionState({ status: "success" });
+    } catch (err) {
+      setActionState({
+        status: "error",
+        message: err instanceof Error ? err.message : "Ошибка при очистке ответа.",
+      });
+    }
+  }
+
+  async function handleFinish() {
+    if (!attempt || !trainingSet) return;
+
+    const unanswered = getUnansweredTasks(trainingSet, attempt.answers);
+    if (unanswered.length > 0) {
+      const ids = unanswered.map((t) => t.id).join(", ");
+      if (!window.confirm(`Вы не ответили на задания: ${ids}. Завершить попытку?`)) {
+        return;
+      }
+    }
+
+    setActionState({ status: "loading" });
+    try {
+      const attemptResult = await trainerApi.submitAttempt(attempt.id);
+      setAttempt({ ...attempt, status: "submitted" });
+      setResult(attemptResult);
+      setShowReview(false);
+      setActionState({ status: "success" });
+    } catch (err) {
+      setActionState({
+        status: "error",
+        message: err instanceof Error ? err.message : "Ошибка при завершении попытки.",
+      });
+    }
+  }
+
+  async function handleRestart() {
+    if (!trainingSet) return;
+    setActionState({ status: "loading" });
+    try {
+      const fresh = await trainerApi.createAttempt(trainingSet.id);
+      localStorage.setItem(STORAGE_ATTEMPT_KEY, fresh.id);
+      setAttempt(fresh);
+      setResult(null);
+      setRestoreMessage(null);
+      setShowReview(false);
+      setSelectedTaskId(trainingSet.tasks[0]?.id ?? "");
+      setActionState({ status: "success" });
+    } catch (err) {
+      setActionState({
+        status: "error",
+        message: err instanceof Error ? err.message : "Не удалось создать новую попытку.",
+      });
+    }
+  }
+
+  if (initState.status === "loading") {
+    return <div>Загрузка модуля с сервера...</div>;
+  }
+
+  if (initState.status === "error" || !trainingSet || !attempt) {
     return (
-      <div style={{ padding: "24px", background: "#fee2e2", borderRadius: "8px" }}>
-        <h1>Ошибка загрузки черновика</h1>
-        <p>{storageError}</p>
-        <button
-          type="button"
-          onClick={handleReset}
-          style={{
-            background: "#c0392b",
-            color: "white",
-            padding: "10px 20px",
-            border: "none",
-            borderRadius: "4px",
-            cursor: "pointer",
-            marginTop: "10px",
-          }}
-        >
-          Явный сброс (Начать новую попытку)
+      <div style={{ padding: "20px", background: "#fee2e2", borderRadius: "8px" }}>
+        <h1>Ошибка подключения к API</h1>
+        <p>{initState.status === "error" ? initState.message : "Неизвестная ошибка."}</p>
+        <button type="button" onClick={() => void loadInitialData()}>
+          Повторить загрузку
         </button>
       </div>
     );
   }
 
-  if (mainSet.tasks.length === 0) {
-    return <div>В модуле пока нет заданий.</div>;
-  }
+  const isSubmitted = attempt.status === "submitted";
+  const isLoading = actionState.status === "loading";
+  const progress = getProgress(trainingSet, attempt.answers);
+  const unansweredTasks = getUnansweredTasks(trainingSet, attempt.answers);
 
-  const currentIndex = mainSet.tasks.findIndex((t) => t.id === state.taskId);
-  const safeIndex = currentIndex !== -1 ? currentIndex : 0;
-  const currentTask = mainSet.tasks[safeIndex];
-  const currentAnswer = state.answers.find((a) => a.taskId === currentTask.id);
-  const progress = getProgress(mainSet, state.answers);
-  const unansweredTasks = getUnansweredTasks(mainSet, state.answers);
+  const errorBanner = actionState.status === "error" && (
+    <div
+      role="alert"
+      style={{
+        background: "#fee2e2",
+        color: "#b91c1c",
+        padding: "10px 12px",
+        borderRadius: "6px",
+        margin: "12px 0",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+      }}
+    >
+      <span>{actionState.message} (Ваш ввод сохранён, повторите действие)</span>
+      <button type="button" onClick={() => setActionState({ status: "idle" })}>
+        Скрыть
+      </button>
+    </div>
+  );
 
-  function handleFinish() {
-    if (unansweredTasks.length > 0) {
-      const ids = unansweredTasks.map((t) => t.id).join(", ");
-      if (!window.confirm(`Вы не ответили на задания: ${ids}. Завершить попытку?`)) {
-        return;
-      }
-    }
-    setShowReview(false);
-    dispatch({ type: "submitted" });
-  }
-
-  if (state.status === "submitted") {
+  if (isSubmitted) {
     return (
       <div>
-        <h1>{mainSet.title} — Результаты</h1>
-        {saveError && (
-          <p style={{ color: "#d97706", fontWeight: "bold" }}>⚠️ {saveError}</p>
-        )}
-        <TaskReview set={mainSet} answers={state.answers} />
-        <button type="button" onClick={handleReset} style={{ marginTop: "20px" }}>
-          Начать новую попытку
+        <h1>{trainingSet.title} — Результаты</h1>
+        <p><small>ID попытки: {attempt.id}</small></p>
+        {errorBanner}
+
+        <TaskReview
+          set={trainingSet}
+          answers={attempt.answers}
+          isSubmitted={true}
+          result={result}
+          actionState={actionState}
+        />
+
+        <button
+          type="button"
+          onClick={() => void handleRestart()}
+          disabled={isLoading}
+          style={{ marginTop: "20px" }}
+        >
+          {isLoading ? "Создание..." : "Начать новую попытку"}
         </button>
       </div>
     );
@@ -155,83 +237,95 @@ export default function App() {
   if (showReview) {
     return (
       <div>
-        <h1>{mainSet.title} — Обзор до завершения</h1>
-        {saveError && (
-          <p style={{ color: "#d97706", fontWeight: "bold" }}>⚠️ {saveError}</p>
-        )}
+        <h1>{trainingSet.title} — Обзор до завершения</h1>
+        <p><small>ID попытки: {attempt.id}</small></p>
+        {errorBanner}
 
         <TaskReview
-          set={mainSet}
-          answers={state.answers}
-          onClear={(taskId) => dispatch({ type: "answerCleared", taskId })}
+          set={trainingSet}
+          answers={attempt.answers}
+          isSubmitted={false}
+          result={null}
+          actionState={actionState}
+          onClear={(taskId) => void handleClearAnswer(taskId)}
           onSelectTask={(taskId) => {
-            dispatch({ type: "moved", taskId });
+            setActionState({ status: "idle" });
+            setSelectedTaskId(taskId);
             setShowReview(false);
           }}
         />
 
         <div style={{ display: "flex", gap: "10px", marginTop: "20px" }}>
-          <button type="button" onClick={() => setShowReview(false)}>
+          <button type="button" onClick={() => setShowReview(false)} disabled={isLoading}>
             Вернуться к заданиям
           </button>
           <button
             type="button"
-            onClick={handleFinish}
-            style={{
-              background: "#244a7c",
-              color: "white",
-              borderColor: "#244a7c",
-            }}
+            onClick={() => void handleFinish()}
+            disabled={isLoading}
+            style={{ background: "#244a7c", color: "white", borderColor: "#244a7c" }}
           >
-            Завершить попытку
+            {isLoading ? "Отправка..." : "Завершить попытку"}
           </button>
         </div>
       </div>
     );
   }
 
+  const currentIndex = trainingSet.tasks.findIndex((t) => t.id === selectedTaskId);
+  const safeIndex = currentIndex !== -1 ? currentIndex : 0;
+  const currentTask = trainingSet.tasks[safeIndex];
+  const currentAnswer = attempt.answers.find((a) => a.taskId === currentTask.id);
+
   return (
     <div>
-      <h1>{mainSet.title}</h1>
+      <h1>{trainingSet.title}</h1>
+      <p><small>ID попытки: {attempt.id}</small></p>
+
+      {restoreMessage && (
+        <p style={{ background: "#fef3c7", padding: "10px 12px", borderRadius: "6px" }}>
+          {restoreMessage}
+        </p>
+      )}
+
+      {errorBanner}
+
       <p>
-        Прогресс: {progress.filled} из {progress.total}
+        Подтверждено сервером: {progress.filled} из {progress.total}
         {unansweredTasks.length > 0
           ? ` (пропущено: ${unansweredTasks.map((t) => t.id).join(", ")})`
-          : " (все задания заполнены)"}
+          : " (все задания сохранены)"}
       </p>
-
-      {saveError && (
-        <p style={{ color: "#d97706", fontWeight: "bold" }}>⚠️ {saveError}</p>
-      )}
 
       <div className="container">
         <TaskList
-          tasks={mainSet.tasks}
-          answers={state.answers}
+          tasks={trainingSet.tasks}
+          answers={attempt.answers}
           selectedId={currentTask.id}
-          onSelect={(taskId) => dispatch({ type: "moved", taskId })}
+          onSelect={(taskId) => {
+            setActionState({ status: "idle" });
+            setSelectedTaskId(taskId);
+          }}
         />
 
         <div style={{ flex: 2 }}>
           <TaskCard
             task={currentTask}
-            answer={currentAnswer}
-            onAnswerChange={(ans) =>
-              dispatch({ type: "answerChanged", answer: ans })
-            }
-            onClear={() =>
-              dispatch({ type: "answerCleared", taskId: currentTask.id })
-            }
+            confirmedAnswer={currentAnswer}
+            isSubmitted={false}
+            actionState={actionState}
+            onSaveAnswer={(ans) => void handleSaveAnswer(ans)}
+            onClearAnswer={(taskId) => void handleClearAnswer(taskId)}
           />
 
           <div style={{ display: "flex", gap: "10px", marginTop: "20px" }}>
             <button
               type="button"
               onClick={() => {
-                const prevId = mainSet.tasks[Math.max(0, safeIndex - 1)].id;
-                dispatch({ type: "moved", taskId: prevId });
+                setActionState({ status: "idle" });
+                setSelectedTaskId(trainingSet.tasks[Math.max(0, safeIndex - 1)].id);
               }}
-              disabled={safeIndex === 0}
+              disabled={safeIndex === 0 || isLoading}
             >
               Назад
             </button>
@@ -239,30 +333,34 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
-                const nextId =
-                  mainSet.tasks[Math.min(mainSet.tasks.length - 1, safeIndex + 1)]
-                    .id;
-                dispatch({ type: "moved", taskId: nextId });
+                setActionState({ status: "idle" });
+                setSelectedTaskId(
+                  trainingSet.tasks[Math.min(trainingSet.tasks.length - 1, safeIndex + 1)].id
+                );
               }}
-              disabled={safeIndex === mainSet.tasks.length - 1}
+              disabled={safeIndex === trainingSet.tasks.length - 1 || isLoading}
             >
               Далее
             </button>
 
-            <button type="button" onClick={() => setShowReview(true)}>
+            <button
+              type="button"
+              onClick={() => {
+                setActionState({ status: "idle" });
+                setShowReview(true);
+              }}
+              disabled={isLoading}
+            >
               Обзор ответов
             </button>
 
             <button
               type="button"
-              onClick={handleFinish}
-              style={{
-                background: "#244a7c",
-                color: "white",
-                borderColor: "#244a7c",
-              }}
+              onClick={() => void handleFinish()}
+              disabled={isLoading}
+              style={{ background: "#244a7c", color: "white", borderColor: "#244a7c" }}
             >
-              Завершить попытку
+              {isLoading ? "Отправка..." : "Завершить попытку"}
             </button>
           </div>
         </div>
